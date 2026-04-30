@@ -1,33 +1,39 @@
 """
 Ad Userbot - Telethon-based user account client
-Handles login, session, and scheduled ad broadcasting.
-Supports Telegram Premium custom emojis.
+- Auto-detects all groups the account has joined (no manual target list needed)
+- Creates a private "Ad Bot Logs" channel on the account for live logging
+- Supports Telegram Premium custom emojis
 """
 
 import asyncio
 import json
 import logging
 import os
+from datetime import datetime
 from typing import Optional
+
 from telethon import TelegramClient, errors
+from telethon.tl.functions.channels import CreateChannelRequest
 from telethon.tl.types import (
-    InputMessageEntityMentionName,
-    MessageEntityCustomEmoji,
+    Channel, Chat,
+    MessageEntityBold, MessageEntityItalic, MessageEntityCode,
+    MessageEntityUnderline, MessageEntityStrike, MessageEntitySpoiler,
+    MessageEntityTextUrl, MessageEntityCustomEmoji,
 )
-from telethon.tl.functions.messages import ForwardMessagesRequest, GetMessagesRequest
-from telethon.sessions import StringSession
 
 logger = logging.getLogger(__name__)
 
-DATA_FILE = "data.json"
+DATA_FILE    = "data.json"
 SESSION_FILE = "userbot.session"
 
+
+# ─── Persistence ──────────────────────────────────────────────────────────────
 
 def load_data() -> dict:
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE) as f:
             return json.load(f)
-    return {"campaigns": [], "targets": [], "next_id": 1}
+    return {"campaigns": [], "next_id": 1, "logs_channel_id": None}
 
 
 def save_data(data: dict):
@@ -35,26 +41,31 @@ def save_data(data: dict):
         json.dump(data, f, indent=2)
 
 
+# ─── AdUserBot ────────────────────────────────────────────────────────────────
+
 class AdUserBot:
     def __init__(self):
         with open("config.json") as f:
             cfg = json.load(f)
-        self.api_id = cfg["api_id"]
+        self.api_id   = cfg["api_id"]
         self.api_hash = cfg["api_hash"]
         self.client: Optional[TelegramClient] = None
         self._tasks: dict[int, asyncio.Task] = {}
         self._phone_hash = None
+        self._logs_channel_id: Optional[int] = load_data().get("logs_channel_id")
         self._init_client()
 
     def _init_client(self):
         self.client = TelegramClient(SESSION_FILE, self.api_id, self.api_hash)
+
+    # ─── Auth ─────────────────────────────────────────────────────────────────
 
     async def is_logged_in(self) -> bool:
         try:
             if not self.client.is_connected():
                 await self.client.connect()
             return await self.client.is_user_authorized()
-        except:
+        except Exception:
             return False
 
     async def send_code(self, phone: str):
@@ -62,7 +73,6 @@ class AdUserBot:
             await self.client.connect()
         result = await self.client.send_code_request(phone)
         self._phone_hash = result.phone_code_hash
-        self._phone = phone
 
     async def sign_in(self, phone: str, code: str) -> str:
         try:
@@ -75,22 +85,99 @@ class AdUserBot:
         await self.client.sign_in(password=password)
 
     async def logout(self):
-        for task in self._tasks.values():
-            task.cancel()
-        self._tasks.clear()
+        await self.stop_all_campaigns()
         try:
             await self.client.log_out()
-        except:
+        except Exception:
             pass
         if os.path.exists(SESSION_FILE):
             os.remove(SESSION_FILE)
+        data = load_data()
+        data["logs_channel_id"] = None
+        save_data(data)
+        self._logs_channel_id = None
         self._init_client()
+
+    # ─── Logs Channel ─────────────────────────────────────────────────────────
+
+    async def setup_logs_channel(self) -> int:
+        """Create the private logs channel if needed, return its id."""
+        data = load_data()
+        existing_id = data.get("logs_channel_id")
+
+        if existing_id:
+            # Verify it still exists
+            try:
+                await self.client.get_entity(existing_id)
+                self._logs_channel_id = existing_id
+                return existing_id
+            except Exception:
+                pass  # Gone — recreate it
+
+        result = await self.client(CreateChannelRequest(
+            title="📋 Ad Bot Logs",
+            about="Live logs for the Ad Bot. Auto-generated.",
+            megagroup=False,
+        ))
+        channel_id = result.chats[0].id
+        # Channels need the -100 prefix for Telethon peer resolution
+        full_id = int(f"-100{channel_id}")
+
+        data["logs_channel_id"] = full_id
+        save_data(data)
+        self._logs_channel_id = full_id
+
+        await self._raw_log("✅ *Ad Bot Logs* channel ready. All activity will appear here.")
+        return full_id
+
+    async def _raw_log(self, text: str):
+        """Send a message to the logs channel (no extra logic to avoid recursion)."""
+        if not self._logs_channel_id:
+            return
+        try:
+            await self.client.send_message(
+                self._logs_channel_id, text,
+                parse_mode="md",
+            )
+        except Exception as e:
+            logger.error(f"Logs channel write failed: {e}")
+
+    async def tg_log(self, text: str, level: str = "INFO"):
+        """Log to Python logger + Telegram logs channel."""
+        icons = {"INFO": "ℹ️", "OK": "✅", "WARN": "⚠️", "ERROR": "❌", "SEND": "📤"}
+        icon  = icons.get(level, "•")
+        ts    = datetime.now().strftime("%H:%M:%S")
+        logger.info(text)
+        await self._raw_log(f"{icon} `[{ts}]` {text}")
+
+    # ─── Group Discovery ──────────────────────────────────────────────────────
+
+    async def get_joined_groups(self) -> list[dict]:
+        """
+        Iterate all dialogs and return every group/supergroup the account
+        is a member of, excluding the logs channel.
+        """
+        groups = []
+        async for dialog in self.client.iter_dialogs():
+            entity = dialog.entity
+            is_group      = isinstance(entity, Chat)
+            is_supergroup = isinstance(entity, Channel) and entity.megagroup
+            if not (is_group or is_supergroup):
+                continue
+            # Skip logs channel
+            if self._logs_channel_id and dialog.id == self._logs_channel_id:
+                continue
+            groups.append({
+                "id":    dialog.id,
+                "title": dialog.title,
+            })
+        return groups
 
     # ─── Campaign Data ────────────────────────────────────────────────────────
 
     def next_campaign_id(self) -> int:
         data = load_data()
-        cid = data["next_id"]
+        cid  = data["next_id"]
         data["next_id"] += 1
         save_data(data)
         return cid
@@ -121,111 +208,129 @@ class AdUserBot:
         data["campaigns"] = [c for c in data["campaigns"] if c["id"] != cid]
         save_data(data)
 
-    def save_targets(self, targets: list):
-        data = load_data()
-        data["targets"] = targets
-        save_data(data)
+    # ─── Entity Rebuilding ────────────────────────────────────────────────────
 
-    def get_targets(self) -> list:
-        return load_data()["targets"]
+    def _rebuild_entities(self, raw: list) -> list:
+        out = []
+        for e in raw:
+            kind = e.get("_", "")
+            o, l = e["offset"], e["length"]
+            if   kind == "MessageEntityCustomEmoji":
+                out.append(MessageEntityCustomEmoji(o, l, e["document_id"]))
+            elif kind == "MessageEntityBold":
+                out.append(MessageEntityBold(o, l))
+            elif kind == "MessageEntityItalic":
+                out.append(MessageEntityItalic(o, l))
+            elif kind == "MessageEntityCode":
+                out.append(MessageEntityCode(o, l))
+            elif kind == "MessageEntityUnderline":
+                out.append(MessageEntityUnderline(o, l))
+            elif kind == "MessageEntityStrike":
+                out.append(MessageEntityStrike(o, l))
+            elif kind == "MessageEntitySpoiler":
+                out.append(MessageEntitySpoiler(o, l))
+            elif kind == "MessageEntityTextUrl":
+                out.append(MessageEntityTextUrl(o, l, e["url"]))
+        return out
 
     # ─── Broadcasting ─────────────────────────────────────────────────────────
 
+    async def _send_to(self, campaign: dict, group: dict):
+        """Send one campaign message to one group. Returns True on success."""
+        target = group["id"]
+        name   = group["title"]
+
+        if campaign["type"] == "text":
+            entities = self._rebuild_entities(campaign.get("entities", []))
+            await self.client.send_message(
+                entity=target,
+                message=campaign.get("text", ""),
+                formatting_entities=entities if entities else None,
+            )
+        elif campaign["type"] == "forward":
+            await self.client.forward_messages(
+                entity=target,
+                messages=campaign["forward_msg_id"],
+                from_peer=campaign["forward_chat"],
+            )
+
+        await self.tg_log(f"📤 Sent to **{name}**", "OK")
+        return True
+
     async def _send_ad(self, campaign: dict):
-        """Send one round of the ad to all target chats."""
-        targets = self.get_targets()
-        if not targets:
-            logger.warning("No targets set, skipping.")
+        """Send this campaign to every joined group."""
+        groups = await self.get_joined_groups()
+
+        if not groups:
+            await self.tg_log("No joined groups found — nothing to send.", "WARN")
             return
 
-        for target in targets:
+        await self.tg_log(
+            f"Campaign **#{campaign['id']}** firing → {len(groups)} group(s)", "SEND"
+        )
+
+        sent = failed = 0
+
+        for g in groups:
             try:
-                if campaign["type"] == "text":
-                    from telethon.tl.types import (
-                        MessageEntityCustomEmoji, MessageEntityBold,
-                        MessageEntityItalic, MessageEntityCode,
-                        MessageEntityUnderline, MessageEntityStrike,
-                        MessageEntitySpoiler, MessageEntityTextUrl,
-                    )
-
-                    text = campaign.get("text", "")
-                    raw_entities = campaign.get("entities", [])
-
-                    # Rebuild Telethon MessageEntity objects from stored dicts
-                    entities = []
-                    for e in raw_entities:
-                        kind = e.get("_", "")
-                        o, l = e["offset"], e["length"]
-                        if kind == "MessageEntityCustomEmoji":
-                            entities.append(MessageEntityCustomEmoji(o, l, e["document_id"]))
-                        elif kind == "MessageEntityBold":
-                            entities.append(MessageEntityBold(o, l))
-                        elif kind == "MessageEntityItalic":
-                            entities.append(MessageEntityItalic(o, l))
-                        elif kind == "MessageEntityCode":
-                            entities.append(MessageEntityCode(o, l))
-                        elif kind == "MessageEntityUnderline":
-                            entities.append(MessageEntityUnderline(o, l))
-                        elif kind == "MessageEntityStrike":
-                            entities.append(MessageEntityStrike(o, l))
-                        elif kind == "MessageEntitySpoiler":
-                            entities.append(MessageEntitySpoiler(o, l))
-                        elif kind == "MessageEntityTextUrl":
-                            entities.append(MessageEntityTextUrl(o, l, e["url"]))
-
-                    await self.client.send_message(
-                        entity=target,
-                        message=text,
-                        formatting_entities=entities if entities else None,
-                    )
-
-                elif campaign["type"] == "forward":
-                    src = campaign["forward_chat"]
-                    msg_id = campaign["forward_msg_id"]
-                    await self.client.forward_messages(
-                        entity=target,
-                        messages=msg_id,
-                        from_peer=src,
-                    )
-
-                logger.info(f"Sent campaign #{campaign['id']} to {target}")
-                await asyncio.sleep(2)  # Small delay between targets
+                await self._send_to(campaign, g)
+                sent += 1
+                await asyncio.sleep(3)  # polite delay between groups
 
             except errors.FloodWaitError as e:
-                logger.warning(f"FloodWait {e.seconds}s, sleeping...")
-                await asyncio.sleep(e.seconds)
+                await self.tg_log(f"FloodWait {e.seconds}s — pausing...", "WARN")
+                await asyncio.sleep(e.seconds + 2)
+                try:
+                    await self._send_to(campaign, g)
+                    sent += 1
+                except Exception as retry_err:
+                    await self.tg_log(f"Retry failed for **{g['title']}**: {retry_err}", "ERROR")
+                    failed += 1
+
+            except errors.ChatWriteForbiddenError:
+                await self.tg_log(f"No write permission in **{g['title']}** — skipping.", "WARN")
+                failed += 1
+
+            except errors.UserBannedInChannelError:
+                await self.tg_log(f"Banned in **{g['title']}** — skipping.", "WARN")
+                failed += 1
+
             except Exception as e:
-                logger.error(f"Failed to send to {target}: {e}")
+                await self.tg_log(f"Error in **{g['title']}**: `{e}`", "ERROR")
+                failed += 1
+
+        await self.tg_log(
+            f"Campaign **#{campaign['id']}** done — ✅ {sent} sent  ❌ {failed} failed"
+        )
 
     async def _campaign_loop(self, campaign_id: int):
-        """Loop that sends the ad at the configured interval."""
         while True:
             campaign = self.get_campaign(campaign_id)
             if not campaign or not campaign.get("active"):
                 break
             await self._send_ad(campaign)
-            interval_minutes = campaign.get("interval", 60)
-            logger.info(f"Campaign #{campaign_id} sent. Next in {interval_minutes}min.")
-            await asyncio.sleep(interval_minutes * 60)
+            interval = campaign.get("interval", 60)
+            await self.tg_log(
+                f"Campaign **#{campaign_id}** — next run in **{interval} min**."
+            )
+            await asyncio.sleep(interval * 60)
+
+    # ─── Control ──────────────────────────────────────────────────────────────
 
     async def start_campaign(self, campaign_id: int):
-        if campaign_id in self._tasks:
-            task = self._tasks[campaign_id]
-            if not task.done():
-                return  # Already running
-
+        if campaign_id in self._tasks and not self._tasks[campaign_id].done():
+            return
         self.update_campaign(campaign_id, {"active": True})
-        loop = asyncio.get_event_loop()
-        task = loop.create_task(self._campaign_loop(campaign_id))
+        task = asyncio.get_event_loop().create_task(self._campaign_loop(campaign_id))
         self._tasks[campaign_id] = task
-        logger.info(f"Campaign #{campaign_id} started.")
+        await self.tg_log(f"Campaign **#{campaign_id}** started.", "OK")
 
     async def stop_campaign(self, campaign_id: int):
         self.update_campaign(campaign_id, {"active": False})
         if campaign_id in self._tasks:
             self._tasks[campaign_id].cancel()
             del self._tasks[campaign_id]
-        logger.info(f"Campaign #{campaign_id} stopped.")
+        await self.tg_log(f"Campaign **#{campaign_id}** stopped.", "WARN")
 
     async def start_all_campaigns(self) -> int:
         count = 0
@@ -241,8 +346,6 @@ class AdUserBot:
         return count
 
     async def resume_active_campaigns(self):
-        """On restart, resume any campaigns that were marked active."""
         for c in self.get_campaigns():
             if c.get("active"):
                 await self.start_campaign(c["id"])
-                logger.info(f"Resumed campaign #{c['id']}")
