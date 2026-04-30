@@ -141,23 +141,43 @@ class AdUserBot:
         for target in targets:
             try:
                 if campaign["type"] == "text":
-                    # Re-fetch the original message to preserve premium emojis & entities
-                    src_chat = campaign.get("source_chat_id")
-                    src_msg = campaign.get("source_msg_id")
-                    if src_chat and src_msg:
-                        # Copy message preserving all entities (including custom emoji)
-                        await self.client.forward_messages(
-                            entity=target,
-                            messages=src_msg,
-                            from_peer=src_chat,
-                            drop_author=True,   # Don't show "Forwarded from"
-                        )
-                    else:
-                        # Fallback: send as plain text
-                        await self.client.send_message(
-                            entity=target,
-                            message=campaign.get("text", ""),
-                        )
+                    from telethon.tl.types import (
+                        MessageEntityCustomEmoji, MessageEntityBold,
+                        MessageEntityItalic, MessageEntityCode,
+                        MessageEntityUnderline, MessageEntityStrike,
+                        MessageEntitySpoiler, MessageEntityTextUrl,
+                    )
+
+                    text = campaign.get("text", "")
+                    raw_entities = campaign.get("entities", [])
+
+                    # Rebuild Telethon MessageEntity objects from stored dicts
+                    entities = []
+                    for e in raw_entities:
+                        kind = e.get("_", "")
+                        o, l = e["offset"], e["length"]
+                        if kind == "MessageEntityCustomEmoji":
+                            entities.append(MessageEntityCustomEmoji(o, l, e["document_id"]))
+                        elif kind == "MessageEntityBold":
+                            entities.append(MessageEntityBold(o, l))
+                        elif kind == "MessageEntityItalic":
+                            entities.append(MessageEntityItalic(o, l))
+                        elif kind == "MessageEntityCode":
+                            entities.append(MessageEntityCode(o, l))
+                        elif kind == "MessageEntityUnderline":
+                            entities.append(MessageEntityUnderline(o, l))
+                        elif kind == "MessageEntityStrike":
+                            entities.append(MessageEntityStrike(o, l))
+                        elif kind == "MessageEntitySpoiler":
+                            entities.append(MessageEntitySpoiler(o, l))
+                        elif kind == "MessageEntityTextUrl":
+                            entities.append(MessageEntityTextUrl(o, l, e["url"]))
+
+                    await self.client.send_message(
+                        entity=target,
+                        message=text,
+                        formatting_entities=entities if entities else None,
+                    )
 
                 elif campaign["type"] == "forward":
                     src = campaign["forward_chat"]
