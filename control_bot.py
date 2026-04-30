@@ -171,12 +171,33 @@ async def new_forward_ad(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def receive_ad_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["ad_text"] = update.message.text
-    context.user_data["ad_source_msg_id"] = update.message.message_id
-    context.user_data["ad_source_chat_id"] = update.message.chat_id
-    # Store entities for premium emoji preservation
-    context.user_data["ad_entities"] = [
-        e.to_dict() for e in (update.message.entities or [])
-    ]
+    # Serialize entities into Telethon-compatible dicts
+    entities = []
+    for e in (update.message.entities or []):
+        entry = {"offset": e.offset, "length": e.length}
+        t = e.type.name
+        if t == "CUSTOM_EMOJI":
+            entry["_"] = "MessageEntityCustomEmoji"
+            entry["document_id"] = int(e.custom_emoji_id)
+        elif t == "TEXT_LINK":
+            entry["_"] = "MessageEntityTextUrl"
+            entry["url"] = e.url
+        elif t == "BOLD":
+            entry["_"] = "MessageEntityBold"
+        elif t == "ITALIC":
+            entry["_"] = "MessageEntityItalic"
+        elif t == "CODE":
+            entry["_"] = "MessageEntityCode"
+        elif t == "UNDERLINE":
+            entry["_"] = "MessageEntityUnderline"
+        elif t == "STRIKETHROUGH":
+            entry["_"] = "MessageEntityStrike"
+        elif t == "SPOILER":
+            entry["_"] = "MessageEntitySpoiler"
+        else:
+            continue
+        entities.append(entry)
+    context.user_data["ad_entities"] = entities
     await update.message.reply_text(
         "⏱ *Set broadcast interval* (in minutes):\n"
         "e.g. `60` = post every hour | `120` = every 2 hours\n\n"
