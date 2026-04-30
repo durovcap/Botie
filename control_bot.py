@@ -46,12 +46,14 @@ def main_menu_keyboard(logged_in: bool):
             InlineKeyboardButton("✏️ New Text Ad", callback_data="new_text_ad"),
             InlineKeyboardButton("🔗 New Forward Ad", callback_data="new_forward_ad"),
         ],
-        [InlineKeyboardButton("🎯 Set Target Chats", callback_data="set_targets")],
         [
             InlineKeyboardButton("🚀 Start All", callback_data="start_all"),
             InlineKeyboardButton("⏹ Stop All", callback_data="stop_all"),
         ],
-        [InlineKeyboardButton("🔓 Logout", callback_data="logout")],
+        [
+            InlineKeyboardButton("👥 View Joined Groups", callback_data="view_groups"),
+            InlineKeyboardButton("🔓 Logout", callback_data="logout"),
+        ],
     ])
 
 
@@ -109,8 +111,10 @@ async def receive_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return AWAITING_2FA
         me = await userbot.client.get_me()
         premium = "⭐ Premium" if me.premium else "Standard"
+        await msg.edit_text("⏳ Setting up logs channel...")
+        await userbot.setup_logs_channel()
         await msg.edit_text(
-            f"✅ *Logged in!*\n👤 {me.first_name} | {premium}",
+            f"✅ *Logged in!*\n👤 {me.first_name} | {premium}\n📋 Logs channel ready.",
             parse_mode="Markdown",
             reply_markup=main_menu_keyboard(True)
         )
@@ -126,8 +130,10 @@ async def receive_2fa(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await userbot.sign_in_2fa(password)
         me = await userbot.client.get_me()
+        await msg.edit_text("⏳ Setting up logs channel...")
+        await userbot.setup_logs_channel()
         await msg.edit_text(
-            f"✅ *Logged in with 2FA!*\n👤 {me.first_name}",
+            f"✅ *Logged in with 2FA!*\n👤 {me.first_name}\n📋 Logs channel ready.",
             parse_mode="Markdown",
             reply_markup=main_menu_keyboard(True)
         )
@@ -321,10 +327,6 @@ async def toggle_campaign(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return MANAGE_ADS
 
     if not campaign.get("active"):
-        targets = userbot.get_targets()
-        if not targets:
-            await query.answer("⚠️ Set target chats first!", show_alert=True)
-            return MANAGE_ADS
         await userbot.start_campaign(campaign_id)
         await query.answer(f"🟢 Campaign #{campaign_id} started!")
     else:
@@ -346,13 +348,6 @@ async def delete_campaign(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def start_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if not userbot.get_targets():
-        await query.edit_message_text(
-            "⚠️ No target chats set! Use *Set Target Chats* first.",
-            parse_mode="Markdown",
-            reply_markup=main_menu_keyboard(True)
-        )
-        return MAIN_MENU
     count = await userbot.start_all_campaigns()
     await query.edit_message_text(
         f"🚀 *{count} campaign(s) started!*",
@@ -374,31 +369,30 @@ async def stop_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return MAIN_MENU
 
 
-# ─── TARGETS ─────────────────────────────────────────────────────────────────
+# ─── VIEW GROUPS ─────────────────────────────────────────────────────────────
 
-async def set_targets(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def view_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    current = userbot.get_targets()
-    current_str = "\n".join(f"• `{t}`" for t in current) if current else "_None set_"
-    await query.edit_message_text(
-        f"🎯 *Target Chats*\n\nCurrently set:\n{current_str}\n\n"
-        "Send a list of chat usernames or IDs *(one per line)*:\n"
-        "`@mymarketplace\n-1001234567890`\n\n"
-        "⚠️ You must already be a member of these chats.",
-        parse_mode="Markdown"
-    )
-    return AWAITING_TARGETS
-
-
-async def receive_targets(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    lines = [l.strip() for l in update.message.text.strip().split("\n") if l.strip()]
-    userbot.save_targets(lines)
-    await update.message.reply_text(
-        f"✅ *{len(lines)} target chat(s) saved!*",
-        parse_mode="Markdown",
-        reply_markup=main_menu_keyboard(True)
-    )
+    await query.edit_message_text("⏳ Fetching joined groups...")
+    try:
+        groups = await userbot.get_joined_groups()
+        if not groups:
+            text = "👥 *Joined Groups*\n\n_No groups found._"
+        else:
+            lines = "\n".join(f"• {g['title']} (`{g['id']}`)" for g in groups)
+            text = f"👥 *Joined Groups* ({len(groups)} total)\n\n{lines}\n\n_Ads will be sent to all of these._"
+        await query.edit_message_text(
+            text, parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("« Back", callback_data="back_main")
+            ]])
+        )
+    except Exception as e:
+        await query.edit_message_text(f"❌ Error: `{e}`", parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("« Back", callback_data="back_main")
+            ]]))
     return MAIN_MENU
 
 
@@ -444,10 +438,11 @@ def main():
                 CallbackQueryHandler(new_text_ad, pattern="^new_text_ad$"),
                 CallbackQueryHandler(new_forward_ad, pattern="^new_forward_ad$"),
                 CallbackQueryHandler(list_ads, pattern="^list_ads$"),
-                CallbackQueryHandler(set_targets, pattern="^set_targets$"),
+                CallbackQueryHandler(view_groups, pattern="^view_groups$"),
                 CallbackQueryHandler(start_all, pattern="^start_all$"),
                 CallbackQueryHandler(stop_all, pattern="^stop_all$"),
                 CallbackQueryHandler(logout, pattern="^logout$"),
+                CallbackQueryHandler(back_main, pattern="^back_main$"),
             ],
             AWAITING_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_phone)],
             AWAITING_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_code)],
@@ -455,7 +450,6 @@ def main():
             AWAITING_AD_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_ad_text)],
             AWAITING_FORWARD_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_forward_link)],
             AWAITING_INTERVAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_interval)],
-            AWAITING_TARGETS: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_targets)],
             MANAGE_ADS: [
                 CallbackQueryHandler(toggle_campaign, pattern="^toggle_"),
                 CallbackQueryHandler(delete_campaign, pattern="^delete_"),
