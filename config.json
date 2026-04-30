@@ -1,0 +1,6 @@
+{
+  "control_bot_token": "YOUR_BOT_TOKEN_HERE",
+  "api_id": 123456,
+  "api_hash": "your_api_hash_here",
+  "owner_ids": [123456789]
+}
