@@ -1,5 +1,9 @@
 """
-Control Bot - Telegram Bot interface to manage ad rotation campaigns
+Control Bot — flat handler architecture.
+Every button works from any state because callbacks are registered at the
+Application level, not locked inside ConversationHandler states.
+Only the text-input flows (login, campaign name, interval, slot text/link)
+use a lightweight ConversationHandler.
 """
 
 import json
@@ -7,622 +11,526 @@ import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
-    MessageHandler, filters, ContextTypes, ConversationHandler
+    MessageHandler, ConversationHandler, filters, ContextTypes,
 )
 from userbot import AdUserBot
 
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# ─── Conversation states ──────────────────────────────────────────────────────
+# ── text-input conversation states ───────────────────────────────────────────
 (
-    MAIN_MENU,
-    AWAITING_PHONE, AWAITING_CODE, AWAITING_2FA,
-    AWAITING_CAMPAIGN_NAME, AWAITING_INTERVAL,
-    CAMPAIGN_MENU,
-    AWAITING_SLOT_TEXT, AWAITING_SLOT_LINK,
-    MANAGE_SLOTS,
-) = range(10)
+    IDLE,
+    AWAIT_PHONE, AWAIT_CODE, AWAIT_2FA,
+    AWAIT_CAMP_NAME, AWAIT_INTERVAL,
+    AWAIT_SLOT_TEXT, AWAIT_SLOT_LINK,
+) = range(8)
 
 with open("config.json") as f:
-    CONFIG = json.load(f)
+    CFG = json.load(f)
 
-BOT_TOKEN = CONFIG["control_bot_token"]
-OWNER_IDS = CONFIG["owner_ids"]
+BOT_TOKEN = CFG["control_bot_token"]
+OWNER_IDS = set(CFG["owner_ids"])
 
-userbot = AdUserBot()
+bot = AdUserBot()
 
 
-# ─── Keyboards ────────────────────────────────────────────────────────────────
+# ── auth guard ────────────────────────────────────────────────────────────────
 
-def main_menu_keyboard(logged_in: bool) -> InlineKeyboardMarkup:
+def is_owner(update: Update) -> bool:
+    return update.effective_user.id in OWNER_IDS
+
+
+# ── keyboards ─────────────────────────────────────────────────────────────────
+
+def kb_main(logged_in: bool) -> InlineKeyboardMarkup:
     if not logged_in:
         return InlineKeyboardMarkup([[
-            InlineKeyboardButton("🔑 Login Telegram Account", callback_data="login")
+            InlineKeyboardButton("🔑 Login Account", callback_data="login"),
         ]])
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📋 My Campaigns", callback_data="list_campaigns")],
-        [InlineKeyboardButton("➕ New Campaign", callback_data="new_campaign")],
-        [
-            InlineKeyboardButton("🚀 Start All", callback_data="start_all"),
-            InlineKeyboardButton("⏹ Stop All",  callback_data="stop_all"),
-        ],
-        [
-            InlineKeyboardButton("👥 Joined Groups", callback_data="view_groups"),
-            InlineKeyboardButton("🔓 Logout",        callback_data="logout"),
-        ],
+        [InlineKeyboardButton("📋 Campaigns",    callback_data="list_campaigns"),
+         InlineKeyboardButton("➕ New Campaign", callback_data="new_campaign")],
+        [InlineKeyboardButton("🚀 Start All",    callback_data="start_all"),
+         InlineKeyboardButton("⏹ Stop All",     callback_data="stop_all")],
+        [InlineKeyboardButton("👥 Joined Groups",callback_data="view_groups"),
+         InlineKeyboardButton("🔓 Logout",       callback_data="logout")],
     ])
 
 
-def back_btn(target: str = "back_main") -> list:
-    return [InlineKeyboardButton("« Back", callback_data=target)]
-
-
-def campaign_menu_keyboard(cid: int, active: bool, slot_count: int) -> InlineKeyboardMarkup:
+def kb_campaign(cid: int, active: bool, n_slots: int) -> InlineKeyboardMarkup:
     toggle = "⏹ Stop" if active else "▶️ Start"
-    buttons = [
-        [InlineKeyboardButton(f"{toggle} Campaign", callback_data=f"ctoggle_{cid}")],
-        [
-            InlineKeyboardButton("✏️ Add Text Ad",    callback_data=f"addtext_{cid}"),
-            InlineKeyboardButton("🔗 Add Forward Ad", callback_data=f"addfwd_{cid}"),
-        ],
+    rows = [
+        [InlineKeyboardButton(f"{toggle} Campaign", callback_data=f"ctoggle:{cid}")],
+        [InlineKeyboardButton("✏️ Add Text Ad",     callback_data=f"addtext:{cid}"),
+         InlineKeyboardButton("🔗 Add Forward Ad",  callback_data=f"addfwd:{cid}")],
     ]
-    if slot_count > 0:
-        buttons.append([InlineKeyboardButton(
-            f"🗂 Manage Slots ({slot_count})", callback_data=f"slots_{cid}"
+    if n_slots:
+        rows.append([InlineKeyboardButton(
+            f"🗂 Manage Slots ({n_slots})", callback_data=f"slots:{cid}"
         )])
-    buttons.append([InlineKeyboardButton("🗑 Delete Campaign", callback_data=f"delcamp_{cid}")])
-    buttons.append(back_btn("list_campaigns"))
-    return InlineKeyboardMarkup(buttons)
+    rows.append([InlineKeyboardButton("🗑 Delete Campaign", callback_data=f"delcamp:{cid}")])
+    rows.append([InlineKeyboardButton("« Back",             callback_data="list_campaigns")])
+    return InlineKeyboardMarkup(rows)
 
 
-# ─── Helpers ──────────────────────────────────────────────────────────────────
+def kb_slots(cid: int, slots: list, cur_idx: int) -> InlineKeyboardMarkup:
+    rows = []
+    for i, s in enumerate(slots):
+        marker = " ▶" if i == cur_idx else ""
+        label  = s.get("text") or s.get("forward_link", "")
+        label  = label[:28] + "…" if len(label) > 28 else label
+        icon   = "✏️" if s["type"] == "text" else "🔗"
+        rows.append([
+            InlineKeyboardButton(f"{icon} {label}{marker}", callback_data="noop"),
+            InlineKeyboardButton("🗑",                      callback_data=f"delslot:{cid}:{s['slot_id']}"),
+        ])
+    rows.append([InlineKeyboardButton("« Back", callback_data=f"camp:{cid}")])
+    return InlineKeyboardMarkup(rows)
 
-def serialize_entities(entities) -> list:
-    """Convert python-telegram-bot MessageEntity list → Telethon-compatible dicts."""
+
+def kb_back_main() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("« Main Menu", callback_data="main")]])
+
+
+# ── shared render helpers ─────────────────────────────────────────────────────
+
+async def render_main(query_or_msg, logged_in: bool, text: str = None):
+    txt = text or ("✅ Account connected." if logged_in else "❌ No account connected.")
+    body = f"🤖 *Ad Bot Control Panel*\n\n{txt}"
+    kb   = kb_main(logged_in)
+    if hasattr(query_or_msg, "edit_message_text"):
+        await query_or_msg.edit_message_text(body, parse_mode="Markdown", reply_markup=kb)
+    else:
+        await query_or_msg.reply_text(body, parse_mode="Markdown", reply_markup=kb)
+
+
+async def render_campaign(query, cid: int):
+    c = bot.get_campaign(cid)
+    if not c:
+        await query.edit_message_text("❌ Campaign not found.", reply_markup=kb_back_main())
+        return
+    slots = c.get("rotation", [])
+    idx   = c.get("current_index", 0)
+    n     = len(slots)
+
+    lines = ""
+    for i, s in enumerate(slots):
+        marker = " ▶️ *next*" if i == idx else f"{i+1}."
+        prev   = (s.get("text") or s.get("forward_link", ""))[:36]
+        icon   = "✏️" if s["type"] == "text" else "🔗"
+        lines += f"{marker} {icon} `{prev}`\n"
+
+    body = (
+        f"📁 *{c['name']}* (#{cid})\n\n"
+        f"⏱ Interval: every `{c['interval']}` min\n"
+        f"🗂 Slots: `{n}`\n"
+        f"Status: {'🟢 Running' if c['active'] else '🔴 Stopped'}\n\n"
+        + (f"*Rotation:*\n{lines}" if lines else "_No slots yet — add some below._")
+    )
+    await query.edit_message_text(
+        body, parse_mode="Markdown",
+        reply_markup=kb_campaign(cid, c["active"], n)
+    )
+
+
+async def render_campaigns(query):
+    camps = bot.get_campaigns()
+    if not camps:
+        await query.edit_message_text(
+            "📋 *No campaigns yet.*\n\nCreate one to get started!",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("➕ New Campaign", callback_data="new_campaign")],
+                [InlineKeyboardButton("« Back",          callback_data="main")],
+            ])
+        )
+        return
+    rows = []
+    txt  = "📋 *Your Campaigns:*\n\n"
+    for c in camps:
+        st   = "🟢" if c["active"] else "🔴"
+        n    = len(c.get("rotation", []))
+        txt += f"{st} *#{c['id']} — {c['name']}* | {n} slot(s) | {c['interval']}min\n"
+        rows.append([InlineKeyboardButton(
+            f"{st} #{c['id']} — {c['name']} ({n} slots)",
+            callback_data=f"camp:{c['id']}"
+        )])
+    rows.append([InlineKeyboardButton("➕ New Campaign", callback_data="new_campaign")])
+    rows.append([InlineKeyboardButton("« Back",          callback_data="main")])
+    await query.edit_message_text(txt, parse_mode="Markdown",
+                                  reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def render_slots(query, cid: int):
+    c = bot.get_campaign(cid)
+    if not c:
+        await query.edit_message_text("❌ Campaign not found.", reply_markup=kb_back_main())
+        return
+    slots = c.get("rotation", [])
+    idx   = c.get("current_index", 0)
+    if not slots:
+        await query.edit_message_text(
+            "🗂 No slots yet. Go back and add some!",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("« Back", callback_data=f"camp:{cid}")
+            ]])
+        )
+        return
+    txt = f"🗂 *Slots — {c['name']}*\n\n"
+    for i, s in enumerate(slots):
+        marker = " ▶️ *next*" if i == idx else f"`{i+1}.`"
+        prev   = (s.get("text") or s.get("forward_link", ""))[:40]
+        icon   = "✏️" if s["type"] == "text" else "🔗"
+        txt   += f"{marker} {icon} `{prev}`\n"
+    await query.edit_message_text(
+        txt, parse_mode="Markdown",
+        reply_markup=kb_slots(cid, slots, idx)
+    )
+
+
+# ── entity serialiser ─────────────────────────────────────────────────────────
+
+def serialise_entities(entities) -> list:
     out = []
     for e in (entities or []):
-        entry = {"offset": e.offset, "length": e.length}
+        d = {"offset": e.offset, "length": e.length}
         t = e.type.name
-        if   t == "CUSTOM_EMOJI":   entry["_"] = "MessageEntityCustomEmoji"; entry["document_id"] = int(e.custom_emoji_id)
-        elif t == "TEXT_LINK":      entry["_"] = "MessageEntityTextUrl";     entry["url"] = e.url
-        elif t == "BOLD":           entry["_"] = "MessageEntityBold"
-        elif t == "ITALIC":         entry["_"] = "MessageEntityItalic"
-        elif t == "CODE":           entry["_"] = "MessageEntityCode"
-        elif t == "UNDERLINE":      entry["_"] = "MessageEntityUnderline"
-        elif t == "STRIKETHROUGH":  entry["_"] = "MessageEntityStrike"
-        elif t == "SPOILER":        entry["_"] = "MessageEntitySpoiler"
+        if   t == "CUSTOM_EMOJI":  d["_"] = "MessageEntityCustomEmoji"; d["document_id"] = int(e.custom_emoji_id)
+        elif t == "TEXT_LINK":     d["_"] = "MessageEntityTextUrl";     d["url"] = e.url
+        elif t == "BOLD":          d["_"] = "MessageEntityBold"
+        elif t == "ITALIC":        d["_"] = "MessageEntityItalic"
+        elif t == "CODE":          d["_"] = "MessageEntityCode"
+        elif t == "UNDERLINE":     d["_"] = "MessageEntityUnderline"
+        elif t == "STRIKETHROUGH": d["_"] = "MessageEntityStrike"
+        elif t == "SPOILER":       d["_"] = "MessageEntitySpoiler"
         else: continue
-        out.append(entry)
+        out.append(d)
     return out
 
 
-def slot_preview(slot: dict, max_len: int = 38) -> str:
-    if slot["type"] == "text":
-        icon = "✏️"
-        txt  = slot.get("text", "")
-    else:
-        icon = "🔗"
-        txt  = slot.get("forward_link", "")
-    txt = txt[:max_len] + ("…" if len(txt) > max_len else "")
-    return f"{icon} `{txt}`"
+# ── /start command ────────────────────────────────────────────────────────────
 
-
-# ─── /start ───────────────────────────────────────────────────────────────────
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in OWNER_IDS:
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
         await update.message.reply_text("⛔ Unauthorized.")
-        return ConversationHandler.END
-    logged_in = await userbot.is_logged_in()
-    status = "✅ Account connected." if logged_in else "❌ No account connected."
-    await update.message.reply_text(
-        f"🤖 *Ad Bot Control Panel*\n\n{status}",
-        parse_mode="Markdown",
-        reply_markup=main_menu_keyboard(logged_in)
-    )
-    return MAIN_MENU
+        return IDLE
+    logged_in = await bot.is_logged_in()
+    await render_main(update.message, logged_in)
+    return IDLE
 
 
-# ─── LOGIN ────────────────────────────────────────────────────────────────────
+# ── global callback router ────────────────────────────────────────────────────
 
-async def login_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text(
-        "📱 Enter your phone number in international format:\n`+1234567890`",
-        parse_mode="Markdown"
-    )
-    return AWAITING_PHONE
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
 
+    if not is_owner(update):
+        await q.answer("⛔ Unauthorized", show_alert=True)
+        return
 
-async def receive_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    phone = update.message.text.strip()
-    context.user_data["phone"] = phone
-    msg = await update.message.reply_text("⏳ Sending OTP...")
-    try:
-        await userbot.send_code(phone)
-        await msg.edit_text(
-            "📨 Code sent! Enter it *(with spaces)*:\n`1 2 3 4 5`",
+    d = q.data
+
+    # ── main menu ─────────────────────────────────────────────────────────────
+    if d == "main":
+        logged_in = await bot.is_logged_in()
+        await render_main(q, logged_in)
+
+    elif d == "login":
+        await q.edit_message_text(
+            "📱 Enter your phone number:\n`+1234567890`",
             parse_mode="Markdown"
         )
-        return AWAITING_CODE
-    except Exception as e:
-        await msg.edit_text(f"❌ Error: `{e}`", parse_mode="Markdown")
-        return ConversationHandler.END
+        context.user_data["conv"] = "phone"
 
+    elif d == "logout":
+        await bot.stop_all_campaigns()
+        await bot.logout()
+        await render_main(q, False, "🔓 Logged out successfully.")
 
-async def receive_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    code  = update.message.text.replace(" ", "").strip()
-    phone = context.user_data.get("phone")
-    msg   = await update.message.reply_text("⏳ Signing in...")
-    try:
-        result = await userbot.sign_in(phone, code)
-        if result == "2fa":
-            await msg.edit_text("🔐 Two-step verification required. Send your password:")
-            return AWAITING_2FA
-        me      = await userbot.client.get_me()
-        premium = "⭐ Premium" if me.premium else "Standard"
-        await msg.edit_text("⏳ Setting up logs channel...")
-        await userbot.setup_logs_channel()
-        await msg.edit_text(
-            f"✅ *Logged in!*\n👤 {me.first_name} | {premium}\n📋 Logs channel ready.",
+    elif d == "view_groups":
+        await q.edit_message_text("⏳ Fetching joined groups…")
+        try:
+            groups = await bot.get_joined_groups()
+            if not groups:
+                body = "👥 *Joined Groups*\n\n_No groups found._"
+            else:
+                lines = "\n".join(f"• {g['title']} (`{g['id']}`)" for g in groups)
+                body  = f"👥 *Joined Groups* ({len(groups)})\n\n{lines}\n\n_Ads go to all of these._"
+        except Exception as e:
+            body = f"❌ Error: `{e}`"
+        await q.edit_message_text(body, parse_mode="Markdown",
+                                  reply_markup=InlineKeyboardMarkup([[
+                                      InlineKeyboardButton("« Back", callback_data="main")
+                                  ]]))
+
+    elif d == "start_all":
+        count = await bot.start_all_campaigns()
+        await render_main(q, True, f"🚀 {count} campaign(s) started!")
+
+    elif d == "stop_all":
+        count = await bot.stop_all_campaigns()
+        await render_main(q, True, f"⏹ {count} campaign(s) stopped.")
+
+    # ── campaign list ─────────────────────────────────────────────────────────
+    elif d == "list_campaigns":
+        await render_campaigns(q)
+
+    elif d == "new_campaign":
+        await q.edit_message_text(
+            "📛 *New Campaign*\n\nSend a name for this campaign:",
             parse_mode="Markdown",
-            reply_markup=main_menu_keyboard(True)
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✖ Cancel", callback_data="list_campaigns")
+            ]])
         )
-        return MAIN_MENU
-    except Exception as e:
-        await msg.edit_text(f"❌ Login failed: `{e}`", parse_mode="Markdown")
-        return ConversationHandler.END
+        context.user_data["conv"] = "camp_name"
 
+    # ── open a campaign ───────────────────────────────────────────────────────
+    elif d.startswith("camp:"):
+        cid = int(d.split(":")[1])
+        await render_campaign(q, cid)
 
-async def receive_2fa(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    password = update.message.text.strip()
-    msg = await update.message.reply_text("⏳ Verifying...")
-    try:
-        await userbot.sign_in_2fa(password)
-        me = await userbot.client.get_me()
-        await msg.edit_text("⏳ Setting up logs channel...")
-        await userbot.setup_logs_channel()
-        await msg.edit_text(
-            f"✅ *Logged in with 2FA!*\n👤 {me.first_name}\n📋 Logs channel ready.",
-            parse_mode="Markdown",
-            reply_markup=main_menu_keyboard(True)
-        )
-        return MAIN_MENU
-    except Exception as e:
-        await msg.edit_text(f"❌ 2FA failed: `{e}`", parse_mode="Markdown")
-        return ConversationHandler.END
-
-
-# ─── CAMPAIGN CREATION ────────────────────────────────────────────────────────
-
-async def new_campaign(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text(
-        "📛 *New Campaign*\n\nGive this campaign a name:\n_(e.g. \"Market Rotation\", \"Phone Ads\")_",
-        parse_mode="Markdown"
-    )
-    return AWAITING_CAMPAIGN_NAME
-
-
-async def receive_campaign_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["campaign_name"] = update.message.text.strip()
-    await update.message.reply_text(
-        "⏱ Set the *interval between each ad* (in minutes):\n"
-        "`60` = 1 hour | `120` = 2 hours\n\n"
-        "_Each slot in the rotation will fire once per interval, in order._",
-        parse_mode="Markdown"
-    )
-    return AWAITING_INTERVAL
-
-
-async def receive_interval(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        interval = int(update.message.text.strip())
-        if interval < 1:
-            raise ValueError
-    except ValueError:
-        await update.message.reply_text("❌ Enter a valid number (minimum 1).")
-        return AWAITING_INTERVAL
-
-    name     = context.user_data.get("campaign_name", "Untitled")
-    campaign = userbot.create_campaign(name, interval)
-
-    context.user_data["active_campaign_id"] = campaign["id"]
-    await update.message.reply_text(
-        f"✅ *Campaign \"{name}\" created!*\n"
-        f"⏱ Interval: every `{interval}` min\n\n"
-        f"Now add ad slots to this campaign:",
-        parse_mode="Markdown",
-        reply_markup=campaign_menu_keyboard(campaign["id"], False, 0)
-    )
-    return CAMPAIGN_MENU
-
-
-# ─── CAMPAIGN LIST ────────────────────────────────────────────────────────────
-
-async def list_campaigns(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    campaigns = userbot.get_campaigns()
-
-    if not campaigns:
-        await query.edit_message_text(
-            "📋 No campaigns yet. Create one first!",
-            reply_markup=InlineKeyboardMarkup([back_btn()])
-        )
-        return MAIN_MENU
-
-    text    = "📋 *Your Campaigns:*\n\n"
-    buttons = []
-    for c in campaigns:
-        status     = "🟢" if c["active"] else "🔴"
-        slot_count = len(c.get("rotation", []))
-        idx        = c.get("current_index", 0)
-        text += (
-            f"{status} *#{c['id']} {c['name']}*\n"
-            f"  ⏱ {c['interval']}min | 🗂 {slot_count} slot(s)"
-            + (f" | next: slot {idx+1}" if slot_count else "") + "\n\n"
-        )
-        buttons.append([InlineKeyboardButton(
-            f"{status} #{c['id']} — {c['name']} ({slot_count} slots)",
-            callback_data=f"opencampaign_{c['id']}"
-        )])
-
-    buttons.append(back_btn())
-    await query.edit_message_text(
-        text, parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(buttons)
-    )
-    return CAMPAIGN_MENU
-
-
-async def open_campaign(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    cid      = int(query.data.split("_")[1])
-    campaign = userbot.get_campaign(cid)
-    if not campaign:
-        await query.answer("Campaign not found!", show_alert=True)
-        return CAMPAIGN_MENU
-
-    context.user_data["active_campaign_id"] = cid
-    slots     = campaign.get("rotation", [])
-    idx       = campaign.get("current_index", 0)
-    slot_count = len(slots)
-
-    text = (
-        f"📁 *Campaign #{cid}: {campaign['name']}*\n\n"
-        f"⏱ Interval: every `{campaign['interval']}` min\n"
-        f"🗂 Slots: `{slot_count}`\n"
-        f"🔄 Next slot: `{idx + 1 if slot_count else '—'}`\n"
-        f"Status: {'🟢 Running' if campaign['active'] else '🔴 Stopped'}\n\n"
-    )
-
-    if slots:
-        text += "*Rotation order:*\n"
-        for i, s in enumerate(slots):
-            marker = "▶️" if i == idx else f"`{i+1}.`"
-            text += f"{marker} {slot_preview(s)}\n"
-
-    await query.edit_message_text(
-        text, parse_mode="Markdown",
-        reply_markup=campaign_menu_keyboard(cid, campaign["active"], slot_count)
-    )
-    return CAMPAIGN_MENU
-
-
-# ─── SLOT ADDING ──────────────────────────────────────────────────────────────
-
-async def add_text_slot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    cid = int(query.data.split("_")[1])
-    context.user_data["active_campaign_id"] = cid
-    context.user_data["slot_type"] = "text"
-    await query.edit_message_text(
-        "✏️ *Add Text Ad Slot*\n\n"
-        "Send the ad message text now.\n"
-        "• Premium custom emojis are preserved ⭐\n"
-        "• *bold*, _italic_, `code`, [links](url) all work",
-        parse_mode="Markdown"
-    )
-    return AWAITING_SLOT_TEXT
-
-
-async def add_forward_slot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    cid = int(query.data.split("_")[1])
-    context.user_data["active_campaign_id"] = cid
-    context.user_data["slot_type"] = "forward"
-    await query.edit_message_text(
-        "🔗 *Add Forward Ad Slot*\n\n"
-        "Send the message link to forward:\n"
-        "`https://t.me/channelname/123`",
-        parse_mode="Markdown"
-    )
-    return AWAITING_SLOT_LINK
-
-
-async def receive_slot_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cid = context.user_data.get("active_campaign_id")
-    slot = {
-        "type":     "text",
-        "text":     update.message.text,
-        "entities": serialize_entities(update.message.entities),
-    }
-    slot_id = userbot.add_slot(cid, slot)
-    campaign = userbot.get_campaign(cid)
-    slots    = campaign.get("rotation", [])
-
-    await update.message.reply_text(
-        f"✅ *Text slot #{slot_id} added!*\n"
-        f"Campaign now has *{len(slots)}* slot(s) in rotation.\n\n"
-        f"Add more or manage slots below:",
-        parse_mode="Markdown",
-        reply_markup=campaign_menu_keyboard(cid, campaign["active"], len(slots))
-    )
-    return CAMPAIGN_MENU
-
-
-async def receive_slot_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cid  = context.user_data.get("active_campaign_id")
-    link = update.message.text.strip()
-    try:
-        clean = link.replace("https://t.me/", "").replace("http://t.me/", "")
-        parts = clean.split("/")
-        forward_chat   = parts[0]
-        forward_msg_id = int(parts[1])
-    except Exception:
-        await update.message.reply_text(
-            "❌ Invalid format. Use `https://t.me/channelname/123`",
-            parse_mode="Markdown"
-        )
-        return AWAITING_SLOT_LINK
-
-    slot = {
-        "type":           "forward",
-        "forward_chat":   forward_chat,
-        "forward_msg_id": forward_msg_id,
-        "forward_link":   link,
-    }
-    slot_id  = userbot.add_slot(cid, slot)
-    campaign = userbot.get_campaign(cid)
-    slots    = campaign.get("rotation", [])
-
-    await update.message.reply_text(
-        f"✅ *Forward slot #{slot_id} added!*\n"
-        f"Campaign now has *{len(slots)}* slot(s) in rotation.",
-        parse_mode="Markdown",
-        reply_markup=campaign_menu_keyboard(cid, campaign["active"], len(slots))
-    )
-    return CAMPAIGN_MENU
-
-
-# ─── SLOT MANAGEMENT ─────────────────────────────────────────────────────────
-
-async def manage_slots(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    cid      = int(query.data.split("_")[1])
-    campaign = userbot.get_campaign(cid)
-    slots    = campaign.get("rotation", []) if campaign else []
-    idx      = campaign.get("current_index", 0) if campaign else 0
-
-    context.user_data["active_campaign_id"] = cid
-
-    if not slots:
-        await query.edit_message_text(
-            "🗂 No slots yet — go back and add some!",
-            reply_markup=InlineKeyboardMarkup([back_btn(f"opencampaign_{cid}")])
-        )
-        return MANAGE_SLOTS
-
-    text    = f"🗂 *Slots for Campaign #{cid}: {campaign['name']}*\n\n"
-    buttons = []
-    for i, s in enumerate(slots):
-        marker  = " ▶️ *next*" if i == idx else ""
-        text   += f"*Slot #{s['slot_id']}*{marker}\n{slot_preview(s)}\n\n"
-        buttons.append([InlineKeyboardButton(
-            f"🗑 Delete slot #{s['slot_id']}", callback_data=f"delslot_{cid}_{s['slot_id']}"
-        )])
-
-    buttons.append(back_btn(f"opencampaign_{cid}"))
-    await query.edit_message_text(
-        text, parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(buttons)
-    )
-    return MANAGE_SLOTS
-
-
-async def delete_slot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query    = update.callback_query
-    await query.answer()
-    parts    = query.data.split("_")   # delslot_{cid}_{slot_id}
-    cid      = int(parts[1])
-    slot_id  = int(parts[2])
-    userbot.delete_slot(cid, slot_id)
-    await query.answer(f"🗑 Slot #{slot_id} deleted.", show_alert=False)
-    # Refresh the slots view
-    query.data = f"slots_{cid}"
-    return await manage_slots(update, context)
-
-
-# ─── CAMPAIGN TOGGLE / DELETE ─────────────────────────────────────────────────
-
-async def toggle_campaign(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query    = update.callback_query
-    await query.answer()
-    cid      = int(query.data.split("_")[1])
-    campaign = userbot.get_campaign(cid)
-    if not campaign:
-        await query.answer("Campaign not found!", show_alert=True)
-        return CAMPAIGN_MENU
-
-    if campaign["active"]:
-        await userbot.stop_campaign(cid)
-        await query.answer(f"⏹ Stopped.", show_alert=False)
-    else:
-        if not campaign.get("rotation"):
-            await query.answer("⚠️ Add at least one ad slot first!", show_alert=True)
-            return CAMPAIGN_MENU
-        await userbot.start_campaign(cid)
-        await query.answer(f"🟢 Started!", show_alert=False)
-
-    # Refresh campaign view
-    query.data = f"opencampaign_{cid}"
-    return await open_campaign(update, context)
-
-
-async def delete_campaign_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    cid   = int(query.data.split("_")[1])
-    await userbot.stop_campaign(cid)
-    userbot.delete_campaign(cid)
-    await query.answer("🗑 Campaign deleted.", show_alert=False)
-    query.data = "list_campaigns"
-    return await list_campaigns(update, context)
-
-
-# ─── START ALL / STOP ALL ─────────────────────────────────────────────────────
-
-async def start_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    count = await userbot.start_all_campaigns()
-    await query.edit_message_text(
-        f"🚀 *{count} campaign(s) started!*",
-        parse_mode="Markdown",
-        reply_markup=main_menu_keyboard(True)
-    )
-    return MAIN_MENU
-
-
-async def stop_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    count = await userbot.stop_all_campaigns()
-    await query.edit_message_text(
-        f"⏹ *{count} campaign(s) stopped.*",
-        parse_mode="Markdown",
-        reply_markup=main_menu_keyboard(True)
-    )
-    return MAIN_MENU
-
-
-# ─── VIEW JOINED GROUPS ───────────────────────────────────────────────────────
-
-async def view_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text("⏳ Fetching joined groups...")
-    try:
-        groups = await userbot.get_joined_groups()
-        if not groups:
-            text = "👥 *Joined Groups*\n\n_No groups found._"
+    # ── toggle start/stop ─────────────────────────────────────────────────────
+    elif d.startswith("ctoggle:"):
+        cid = int(d.split(":")[1])
+        c   = bot.get_campaign(cid)
+        if not c:
+            await q.answer("Campaign not found!", show_alert=True)
+            return
+        if c["active"]:
+            await bot.stop_campaign(cid)
         else:
-            lines = "\n".join(f"• {g['title']} (`{g['id']}`)" for g in groups)
-            text  = f"👥 *Joined Groups* ({len(groups)} total)\n\n{lines}\n\n_Ads are sent to all of these._"
-        await query.edit_message_text(
-            text, parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([back_btn()])
+            if not c.get("rotation"):
+                await q.answer("⚠️ Add at least one slot first!", show_alert=True)
+                return
+            await bot.start_campaign(cid)
+        await render_campaign(q, cid)
+
+    # ── delete campaign ───────────────────────────────────────────────────────
+    elif d.startswith("delcamp:"):
+        cid = int(d.split(":")[1])
+        await bot.stop_campaign(cid)
+        bot.delete_campaign(cid)
+        await render_campaigns(q)
+
+    # ── add text slot ─────────────────────────────────────────────────────────
+    elif d.startswith("addtext:"):
+        cid = int(d.split(":")[1])
+        context.user_data["conv"]     = "slot_text"
+        context.user_data["conv_cid"] = cid
+        await q.edit_message_text(
+            "✏️ *Add Text Ad*\n\nSend your ad text now.\n"
+            "Premium emojis ⭐, *bold*, _italic_, `code` all supported.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✖ Cancel", callback_data=f"camp:{cid}")
+            ]])
         )
-    except Exception as e:
-        await query.edit_message_text(
-            f"❌ Error: `{e}`", parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([back_btn()])
+
+    # ── add forward slot ──────────────────────────────────────────────────────
+    elif d.startswith("addfwd:"):
+        cid = int(d.split(":")[1])
+        context.user_data["conv"]     = "slot_link"
+        context.user_data["conv_cid"] = cid
+        await q.edit_message_text(
+            "🔗 *Add Forward Ad*\n\nSend the message link:\n`https://t.me/channel/123`",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✖ Cancel", callback_data=f"camp:{cid}")
+            ]])
         )
-    return MAIN_MENU
+
+    # ── manage slots ──────────────────────────────────────────────────────────
+    elif d.startswith("slots:"):
+        cid = int(d.split(":")[1])
+        await render_slots(q, cid)
+
+    # ── delete a slot ─────────────────────────────────────────────────────────
+    elif d.startswith("delslot:"):
+        _, cid_s, sid_s = d.split(":")
+        cid = int(cid_s)
+        sid = int(sid_s)
+        bot.delete_slot(cid, sid)
+        await render_slots(q, cid)
+
+    elif d == "noop":
+        pass  # slot label button — do nothing
 
 
-# ─── MISC ─────────────────────────────────────────────────────────────────────
+# ── text message router ───────────────────────────────────────────────────────
 
-async def logout(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    await userbot.stop_all_campaigns()
-    await userbot.logout()
-    await query.edit_message_text("🔓 Logged out.", reply_markup=main_menu_keyboard(False))
-    return MAIN_MENU
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        return
+
+    conv = context.user_data.get("conv")
+    text = update.message.text.strip()
+
+    # ── login: phone ──────────────────────────────────────────────────────────
+    if conv == "phone":
+        context.user_data["phone"] = text
+        context.user_data["conv"]  = None
+        msg = await update.message.reply_text("⏳ Sending OTP…")
+        try:
+            await bot.send_code(text)
+            await msg.edit_text(
+                "📨 Code sent! Enter it with spaces:\n`1 2 3 4 5`",
+                parse_mode="Markdown"
+            )
+            context.user_data["conv"] = "code"
+        except Exception as e:
+            await msg.edit_text(f"❌ Failed: `{e}`", parse_mode="Markdown",
+                                reply_markup=kb_back_main())
+
+    # ── login: OTP code ───────────────────────────────────────────────────────
+    elif conv == "code":
+        code = text.replace(" ", "")
+        context.user_data["conv"] = None
+        msg = await update.message.reply_text("⏳ Signing in…")
+        try:
+            result = await bot.sign_in(context.user_data.get("phone", ""), code)
+            if result == "2fa":
+                await msg.edit_text("🔐 Enter your 2FA password:")
+                context.user_data["conv"] = "2fa"
+            else:
+                me = await bot.client.get_me()
+                premium = "⭐ Premium" if me.premium else "Standard"
+                await msg.edit_text("⏳ Setting up logs channel…")
+                await bot.setup_logs_channel()
+                await msg.edit_text(
+                    f"✅ *Logged in!*\n👤 {me.first_name} | {premium}\n📋 Logs channel ready.",
+                    parse_mode="Markdown",
+                    reply_markup=kb_main(True)
+                )
+        except Exception as e:
+            await msg.edit_text(f"❌ Login failed: `{e}`", parse_mode="Markdown",
+                                reply_markup=kb_back_main())
+
+    # ── login: 2FA ────────────────────────────────────────────────────────────
+    elif conv == "2fa":
+        context.user_data["conv"] = None
+        msg = await update.message.reply_text("⏳ Verifying…")
+        try:
+            await bot.sign_in_2fa(text)
+            me = await bot.client.get_me()
+            await msg.edit_text("⏳ Setting up logs channel…")
+            await bot.setup_logs_channel()
+            await msg.edit_text(
+                f"✅ *Logged in with 2FA!*\n👤 {me.first_name}\n📋 Logs channel ready.",
+                parse_mode="Markdown",
+                reply_markup=kb_main(True)
+            )
+        except Exception as e:
+            await msg.edit_text(f"❌ 2FA failed: `{e}`", parse_mode="Markdown",
+                                reply_markup=kb_back_main())
+
+    # ── new campaign: name ────────────────────────────────────────────────────
+    elif conv == "camp_name":
+        context.user_data["camp_name"] = text
+        context.user_data["conv"]      = "interval"
+        await update.message.reply_text(
+            "⏱ Set the *interval* in minutes between each ad:\n"
+            "`60` = 1 hour  |  `120` = 2 hours",
+            parse_mode="Markdown"
+        )
+
+    # ── new campaign: interval ────────────────────────────────────────────────
+    elif conv == "interval":
+        try:
+            mins = int(text)
+            if mins < 1:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("❌ Enter a whole number ≥ 1.")
+            return
+        context.user_data["conv"] = None
+        name     = context.user_data.pop("camp_name", "Untitled")
+        campaign = bot.create_campaign(name, mins)
+        await update.message.reply_text(
+            f"✅ *Campaign \"{name}\" created!*\n"
+            f"⏱ {mins} min interval\n\nNow add ad slots:",
+            parse_mode="Markdown",
+            reply_markup=kb_campaign(campaign["id"], False, 0)
+        )
+
+    # ── add text slot ─────────────────────────────────────────────────────────
+    elif conv == "slot_text":
+        context.user_data["conv"] = None
+        cid  = context.user_data.pop("conv_cid", None)
+        slot = {
+            "type":     "text",
+            "text":     text,
+            "entities": serialise_entities(update.message.entities),
+        }
+        bot.add_slot(cid, slot)
+        c = bot.get_campaign(cid)
+        n = len(c.get("rotation", [])) if c else 0
+        await update.message.reply_text(
+            f"✅ *Text slot added!* Campaign now has *{n}* slot(s).",
+            parse_mode="Markdown",
+            reply_markup=kb_campaign(cid, c["active"] if c else False, n)
+        )
+
+    # ── add forward slot ──────────────────────────────────────────────────────
+    elif conv == "slot_link":
+        cid = context.user_data.get("conv_cid")
+        try:
+            clean  = text.replace("https://t.me/", "").replace("http://t.me/", "")
+            parts  = clean.split("/")
+            f_chat = parts[0]
+            f_mid  = int(parts[1])
+        except Exception:
+            await update.message.reply_text(
+                "❌ Invalid link. Use `https://t.me/channelname/123`",
+                parse_mode="Markdown"
+            )
+            return
+        context.user_data["conv"] = None
+        context.user_data.pop("conv_cid", None)
+        slot = {
+            "type":           "forward",
+            "forward_chat":   f_chat,
+            "forward_msg_id": f_mid,
+            "forward_link":   text,
+        }
+        bot.add_slot(cid, slot)
+        c = bot.get_campaign(cid)
+        n = len(c.get("rotation", [])) if c else 0
+        await update.message.reply_text(
+            f"✅ *Forward slot added!* Campaign now has *{n}* slot(s).",
+            parse_mode="Markdown",
+            reply_markup=kb_campaign(cid, c["active"] if c else False, n)
+        )
+
+    # ── no active conv ────────────────────────────────────────────────────────
+    else:
+        logged_in = await bot.is_logged_in()
+        await update.message.reply_text(
+            "Use /start to open the control panel.",
+            reply_markup=kb_main(logged_in)
+        )
 
 
-async def back_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query     = update.callback_query
-    await query.answer()
-    logged_in = await userbot.is_logged_in()
-    await query.edit_message_text(
-        "🤖 *Ad Bot Control Panel*",
-        parse_mode="Markdown",
-        reply_markup=main_menu_keyboard(logged_in)
-    )
-    return MAIN_MENU
-
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logged_in = await userbot.is_logged_in()
-    await update.message.reply_text("❌ Cancelled.", reply_markup=main_menu_keyboard(logged_in))
-    return MAIN_MENU
-
-
-# ─── MAIN ─────────────────────────────────────────────────────────────────────
+# ── main ──────────────────────────────────────────────────────────────────────
 
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
-    conv = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
-        states={
-            MAIN_MENU: [
-                CallbackQueryHandler(login_start,     pattern="^login$"),
-                CallbackQueryHandler(new_campaign,    pattern="^new_campaign$"),
-                CallbackQueryHandler(list_campaigns,  pattern="^list_campaigns$"),
-                CallbackQueryHandler(start_all,       pattern="^start_all$"),
-                CallbackQueryHandler(stop_all,        pattern="^stop_all$"),
-                CallbackQueryHandler(view_groups,     pattern="^view_groups$"),
-                CallbackQueryHandler(logout,          pattern="^logout$"),
-                CallbackQueryHandler(back_main,       pattern="^back_main$"),
-            ],
-            AWAITING_PHONE:  [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_phone)],
-            AWAITING_CODE:   [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_code)],
-            AWAITING_2FA:    [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_2fa)],
+    # /start — just shows the menu, no state machine needed
+    app.add_handler(CommandHandler("start", cmd_start))
 
-            AWAITING_CAMPAIGN_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_campaign_name)],
-            AWAITING_INTERVAL:      [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_interval)],
+    # All button presses — registered globally, always work
+    app.add_handler(CallbackQueryHandler(on_callback))
 
-            CAMPAIGN_MENU: [
-                CallbackQueryHandler(list_campaigns,         pattern="^list_campaigns$"),
-                CallbackQueryHandler(open_campaign,          pattern="^opencampaign_"),
-                CallbackQueryHandler(add_text_slot,          pattern="^addtext_"),
-                CallbackQueryHandler(add_forward_slot,       pattern="^addfwd_"),
-                CallbackQueryHandler(manage_slots,           pattern="^slots_"),
-                CallbackQueryHandler(toggle_campaign,        pattern="^ctoggle_"),
-                CallbackQueryHandler(delete_campaign_handler,pattern="^delcamp_"),
-                CallbackQueryHandler(back_main,              pattern="^back_main$"),
-            ],
-            AWAITING_SLOT_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_slot_text)],
-            AWAITING_SLOT_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_slot_link)],
+    # All text — routed by context.user_data["conv"] key
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
-            MANAGE_SLOTS: [
-                CallbackQueryHandler(delete_slot,    pattern="^delslot_"),
-                CallbackQueryHandler(manage_slots,   pattern="^slots_"),
-                CallbackQueryHandler(open_campaign,  pattern="^opencampaign_"),
-            ],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-        per_message=False,
-        allow_reentry=True,
-    )
-
-    app.add_handler(conv)
-    logger.info("✅ Control bot polling...")
-    app.run_polling()
+    logger.info("✅ Bot is running…")
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
